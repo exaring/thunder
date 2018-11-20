@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"regexp"
+	"strings"
 
 	"github.com/samsarahq/thunder/graphql"
 )
@@ -95,6 +97,8 @@ type ConnectionArgs struct {
 	Before *string
 	// User-facing args.
 	Args interface{}
+	// filter: "text search"
+	Filter *string
 }
 
 // PaginationArgs are used in externally set connections by embedding them in an args struct. They
@@ -104,6 +108,8 @@ type PaginationArgs struct {
 	Last   *int64
 	After  *string
 	Before *string
+
+	Filter *string
 }
 
 func (p PaginationArgs) limit() int {
@@ -148,6 +154,8 @@ type connectionContext struct {
 	ReturnsPageInfo bool
 	// The index of PaginationArgs in the arguments provided to the FieldFunc.
 	PaginationArgsIndex int
+	// The GraphQL fields for filtered text to be resolved.
+	FilterTextFields map[string]*graphql.Field
 }
 
 // embedsPaginationArgs returns true if PaginationArgs were embedded.
@@ -372,12 +380,76 @@ func (c *connectionContext) pagesFromEdges(edges []Edge, limit int) (pages []str
 	return pages
 }
 
+var matchGroups = regexp.MustCompile(`(?:([^\s"]+)|"([^"]*)"?)+`)
+
+// Split terms by spaces, except for spaces within quotes.
+// Like http://stackoverflow.com/questions/16261635/javascript-split-string-by-space-but-ignore-space-in-quotes-notice-not-to-spli
+// except:
+// - Treat the query ["san fran] as having the single term ["san fran"] instead of ["san", "fran"]
+// - Removes the delimiting quotes.
+func matchString(str, query string) bool {
+	matches := matchGroups.FindAllStringSubmatch(query, -1)
+	for _, match := range matches {
+		if len(match) < 2 {
+			continue
+		}
+		if strings.Contains(str, match[1]) {
+			return true
+		}
+	}
+	return false
+}
+
+func (c *connectionContext) applyTextFilter(nodes []interface{}, args PaginationArgs) ([]interface{}, error) {
+	if args.Filter == nil || *args.Filter == "" {
+		return nodes, nil
+	}
+
+	var filteredNodes []interface{}
+	for _, node := range nodes {
+		keep := false
+		// For each possible field we're matching against, check if there's a match.
+		for _, filterField := range c.FilterTextFields {
+			// Resolve the graphql.Field made for sorting.
+			text, err := filterField.Resolve(context.TODO(), node, nil, nil)
+			if err != nil {
+				return nil, err
+			}
+
+			// Only strings are allowed for FilterText fields.
+			textString, ok := text.(string)
+			if !ok {
+				return nil, errors.New("Text was not a string")
+			}
+
+			if matchString(textString, *args.Filter) {
+				keep = true
+				break
+			}
+		}
+
+		if keep {
+			filteredNodes = append(filteredNodes, node)
+		}
+	}
+
+	return filteredNodes, nil
+}
+
 // getConnection applies the ConnectionArgs to nodes and returns the result in a wrapped Connection
 // type.
 func (c *connectionContext) getConnection(out []reflect.Value, args PaginationArgs) (Connection, error) {
 	nodes := castSlice(out[0].Interface())
 	if len(nodes) == 0 {
 		return Connection{}, nil
+	}
+
+	if !c.IsExternallyManaged() {
+		var err error
+		nodes, err = c.applyTextFilter(nodes, args)
+		if err != nil {
+			return Connection{}, nil
+		}
 	}
 
 	limit := args.limit()
@@ -432,6 +504,34 @@ func indexOfPaginationArgs(argType reflect.Type) int {
 		}
 	}
 	return -1
+}
+
+func getFuncReturnValue(fn interface{}) reflect.Type {
+	typ := reflect.TypeOf(fn)
+	return typ.Out(0)
+}
+
+func (c *connectionContext) consumeTextFilters(sb *schemaBuilder, m *method, typ reflect.Type) error {
+	c.FilterTextFields = make(map[string]*graphql.Field)
+
+	for name, fn := range m.TextFilterFuncs {
+		funcTyp := getFuncReturnValue(fn)
+		if funcTyp != reflect.TypeOf("") {
+			return fmt.Errorf("%s: Sort field must be a string", name)
+		}
+
+		// Build a GraphQL field for the function.
+		field, err := sb.buildFunction(typ, &method{MarkedNonNullable: true, Fn: fn})
+		if err != nil {
+			return err
+		}
+		if field.Args != nil && len(field.Args) > 0 {
+			return fmt.Errorf("%s: Text filter fields can't take arguments", name)
+		}
+		c.FilterTextFields[name] = field
+	}
+
+	return nil
 }
 
 func (c *connectionContext) consumePaginatedArgs(sb *schemaBuilder, in []reflect.Type) (*argParser, graphql.Type, []reflect.Type, error) {
@@ -571,6 +671,10 @@ func (sb *schemaBuilder) buildPaginatedField(typ reflect.Type, m *method) (*grap
 		return nil, err
 	}
 
+	if err := c.consumeTextFilters(sb, m, nodeType); err != nil {
+		return nil, err
+	}
+
 	c.Key, err = sb.getKeyFieldOnStruct(nodeType)
 	if err != nil {
 		return nil, err
@@ -621,6 +725,7 @@ func (c *connectionContext) extractReturnAndErr(out []reflect.Value, args interf
 			Last:   connectionArgs.Last,
 			After:  connectionArgs.After,
 			Before: connectionArgs.Before,
+			Filter: connectionArgs.Filter,
 		}
 	} else {
 		paginationArgs = reflect.ValueOf(args).Field(c.PaginationArgsIndex).Interface().(PaginationArgs)

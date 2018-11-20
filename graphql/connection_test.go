@@ -65,31 +65,20 @@ func TestConnection(t *testing.T) {
 	item := schema.Object("item", Item{})
 	item.Key("id")
 	inner.FieldFunc("innerConnection", func(args Args) []Item {
-		retList := make([]Item, 5)
-		retList[0] = Item{Id: 1}
-		retList[1] = Item{Id: 2}
-		retList[2] = Item{Id: 3}
-		retList[3] = Item{Id: 4}
-		retList[4] = Item{Id: 5}
-		return retList
+		return []Item{{1}, {2}, {3}, {4}, {5}}
 	}, schemabuilder.Paginated)
+	inner.FieldFunc("innerConnectionWithFilter", func() []Item {
+		return []Item{{1}, {2}, {3}, {4}, {5}}
+	}, schemabuilder.Paginated, schemabuilder.TextFilterFields{
+		"foo": func(ctx context.Context, i Item) string {
+			return []string{"can", "man", "cannot", "soban", "socan"}[i.Id-1]
+		},
+	})
 	inner.FieldFunc("innerConnectionNilArg", func() []Item {
-		retList := make([]Item, 5)
-		retList[0] = Item{Id: 1}
-		retList[1] = Item{Id: 2}
-		retList[2] = Item{Id: 3}
-		retList[3] = Item{Id: 4}
-		retList[4] = Item{Id: 5}
-		return retList
+		return []Item{{1}, {2}, {3}, {4}, {5}}
 	}, schemabuilder.Paginated)
 	inner.FieldFunc("innerConnectionWithCtxAndError", func(ctx context.Context, args Args) ([]Item, error) {
-		retList := make([]Item, 5)
-		retList[0] = Item{Id: 1}
-		retList[1] = Item{Id: 2}
-		retList[2] = Item{Id: 3}
-		retList[3] = Item{Id: 4}
-		retList[4] = Item{Id: 5}
-		return retList, nil
+		return []Item{{1}, {2}, {3}, {4}, {5}}, nil
 	}, schemabuilder.Paginated)
 	inner.FieldFunc("innerConnectionWithError", func(ctx context.Context, args Args) ([]*Item, error) {
 		return nil, graphql.NewSafeError("this is an error")
@@ -249,6 +238,43 @@ func TestConnection(t *testing.T) {
 	snap.SnapshotQuery("Pagination, with error", `{
 		inner {
 			innerConnection(last: -2, before: "", additional: "jk") {
+				totalCount
+				edges {
+					node {
+						id
+					}
+					cursor
+				}
+				pageInfo {
+					hasNextPage
+					hasPrevPage
+					startCursor
+					endCursor
+					pages
+				}
+			}
+		}
+	}`)
+
+	snap.SnapshotQuery("Pagination, filter", `{
+		inner {
+			filterByCan: innerConnectionWithFilter(filter: "can", first: 5, after: "") {
+				totalCount
+				edges {
+					node {
+						id
+					}
+					cursor
+				}
+				pageInfo {
+					hasNextPage
+					hasPrevPage
+					startCursor
+					endCursor
+					pages
+				}
+			}
+			filterByBan: innerConnectionWithFilter(filter: "ban", first: 5, after: "") {
 				totalCount
 				edges {
 					node {
